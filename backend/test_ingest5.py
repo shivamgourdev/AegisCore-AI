@@ -1,9 +1,5 @@
-﻿from app.services.ingestion_service import extract_and_chunk
-content = b"# Machine Learning\n\nTest document."
-result = extract_and_chunk(content, "test.md", "text/markdown")
-print("Extraction successful:", len(result["chunks"]), "chunks")
-for chunk in result["chunks"]:
-    print("  Chunk", chunk["chunk_index"], ":", len(chunk["content"]), "chars")
-except Exception as e:
-    import traceback
-    traceback.print_exc()
+from app.services.ingestion_service import extract_and_chunk
+
+content = b"# Test Document 5\n\nThis is test document 5 for ingestion."
+result = extract_and_chunk(content, 'test5.md', 'text/markdown')
+print(f"Chunks 5: {len(result['chunks'])}")

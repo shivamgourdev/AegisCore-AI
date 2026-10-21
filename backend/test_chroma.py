@@ -1,5 +1,6 @@
-﻿import chromadb
+import chromadb
 from app.services.embedding_service import EmbeddingService
+from app.services.vector_store import VectorStore
 from app.core.config import settings
 
 vs = VectorStore()
@@ -24,6 +25,6 @@ for c in collections:
     if ids:
         print(f"\nCollection {c.name}: {len(ids)} results")
         for i, doc_id in enumerate(ids):
-            print(f"  Result {i}: id={doc_id}, doc={results[\"documents\"][0][i][:50]}..., meta={results[\"metadatas\"][0][i]}")
+            print(f"  Result {i}: id={doc_id}, doc={results['documents'][0][i][:50]}..., meta={results['metadatas'][0][i]}")
     else:
         print(f"\nCollection {c.name}: 0 results")

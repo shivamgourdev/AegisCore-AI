@@ -1,4 +1,4 @@
-﻿from app.services.ingestion_service import extract_and_chunk
+from app.services.ingestion_service import extract_and_chunk
 
 content = b"# Machine Learning\n\nTest document."
 

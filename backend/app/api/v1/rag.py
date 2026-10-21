@@ -30,12 +30,6 @@ logger = logging.getLogger(__name__)
 
 def _get_rag_service() -> RAGService:
     """Create a RAG service instance with all dependencies."""
-    embedding_service = EmbeddingService()
-    vector_store = VectorStore()
-    bm25_store = None  # Will be initialized with chunks from DB
-    rerank_service = None  # Will be initialized conditionally
-    generation_service = GenerationService()
-
     return RAGService()
 
 
@@ -55,6 +49,7 @@ async def ingest_document(
     # Read file content
     try:
         content = await file.read()
+        await file.seek(0)
     except Exception as e:
         logger.error(f"Failed to read uploaded file: {type(e).__name__}: {e}")
         raise HTTPException(status_code=415, detail=f"Failed to read file: {str(e)}")
@@ -69,20 +64,15 @@ async def ingest_document(
         traceback.print_exc()
         raise HTTPException(status_code=415, detail=f"Upload validation error: {str(e)}")
 
-    # Re-read content (validate_upload consumed it)
-    content = await file.read()
-
     # Extract and chunk
     try:
         result = extract_and_chunk(content, file.filename, file.content_type)
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
     except Exception as e:
-        import traceback
         traceback.print_exc()
         error_msg = f"Extraction error: {type(e).__name__}: {e}"
         logger.error(error_msg)
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=error_msg)
 
     # Store document record in PostgreSQL
@@ -139,7 +129,6 @@ async def ingest_document(
         embeddings = embedding_service.get_embeddings(embedding_texts)
         logger.info(f"Generated {len(embeddings)} embeddings")
     except Exception as e:
-        import traceback
         tb_str = traceback.format_exc()
         logger.error(f"Embedding failed: {type(e).__name__}: {e}\n{tb_str}")
         db_document.status = "failed"
