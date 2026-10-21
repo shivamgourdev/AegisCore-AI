@@ -1,0 +1,258 @@
+=== RAG FACTORY ===
+"""RAG API routes.
+
+Endpoints:
+- POST /api/v1/rag/ingest - Upload and index a document
+- POST /api/v1/rag/query - Ask a question over uploaded documents
+- GET /api/v1/rag/documents - List user's documents
+- DELETE /api/v1/rag/documents/{document_id} - Delete a document
+- GET /api/v1/rag/documents/{document_id} - Get document metadata
+"""
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+
+from app.core.config import settings
+from app.dependencies import get_current_active_user, get_db
+from app.models.user import User
+from app.services.embedding_service import EmbeddingService
+from app.services.generation_service import GenerationService
+from app.services.ingestion_service import extract_and_chunk
+from app.services.rag_service import RAGService
+from app.services.upload_service import validate_upload
+from app.services.vector_store import VectorStore
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _get_rag_service() -> RAGService:
+    """Create a RAG service instance with all dependencies."""
+    embedding_service = EmbeddingService()
+    vector_store = VectorStore()
+    bm25_store = None  # Will be initialized with chunks from DB
+    rerank_service = None  # Will be initialized conditionally
+    generation_service = GenerationService()
+
+    return RAGService(
+        embedding_service=embedding_service,
+        vector_store=vector_store,
+        bm25_store=bm25_store,
+        rerank_service=rerank_service,
+        generation_service=generation_service,
+    )
+
+
+@router.post("/ingest", status_code=201)
+async def ingest_document(
+    file: UploadFile,
+    current_user: User = Depends(get_current_active_user),
+    db=Depends(get_db),
+) -> dict[str, Any]:
+    """Upload and index a document.
+
+    Extracts text, chunks it, generates embeddings, and stores everything
+    for RAG retrieval.
+    """
+    import traceback
+
+    # Read file content
+    try:
+        content = await file.read()
+    except Exception as e:
+        logger.error(f"Failed to read uploaded file: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=415, detail=f"Failed to read file: {str(e)}")
+
+    # Validate upload
+    try:
+        extension = validate_upload(file.filename, file.content_type, file)
+    except ValueError as e:
+        raise HTTPException(status_code=415, detail=str(e))
+    except Exception as e:
+        logger.error(f"Upload validation error: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=415, detail=f"Upload validation error: {str(e)}")
+
+=== RAG SERVICE CONSTRUCTOR AND CLASS ===
+"""RAG orchestration service.
+
+Coordinates the full RAG pipeline:
+1. Query embedding (Ollama nomic-embed-text)
+2. Dense retrieval (ChromaDB) + BM25 retrieval
+3. RRF fusion
+4. Cross-Encoder reranking
+5. LLM generation (Gemini â†’ Ollama)
+6. Citation verification gate
+7. Abstention gate
+"""
+
+import logging
+from typing import Any
+
+from app.core.config import settings
+from app.core.database import SessionLocal
+from app.models.document import Document, Chunk
+from app.services.embedding_service import EmbeddingService
+from app.services.generation_service import GenerationService
+from app.services.rerank_service import RerankService
+from app.services.vector_store import VectorStore
+from app.services.bm25_store import BM25Store
+
+logger = logging.getLogger(__name__)
+
+
+class RAGService:
+    """Orchestrates the full RAG pipeline.
+
+    Components:
+    - EmbeddingService: Query embedding via Ollama
+    - VectorStore: Dense retrieval via ChromaDB
+    - BM25Store: Sparse retrieval via BM25
+    - RerankService: Cross-Encoder reranking
+    - GenerationService: LLM answer generation (Gemini â†’ Ollama)
+    """
+
+    def __init__(self) -> None:
+        self.embedding_service = EmbeddingService()
+        self.vector_store = VectorStore()
+        self.bm25_store = BM25Store()
+        self.rerank_service = RerankService()
+        self.generation_service = GenerationService()
+        self.rrf_k = settings.rag_rerank_top_k if hasattr(settings, "rag_rerank_top_k") else 8
+
+    def retrieve(
+        self,
+        user_id: str,
+        query: str,
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Perform hybrid retrieval: dense + BM25 + RRF fusion.
+
+        Args:
+            user_id: User ID for isolation.
+            query: User question text.
+            top_k: Maximum number of results after fusion.
+
+        Returns:
+            List of candidate chunks with scores.
+        """
+        # Dense retrieval via ChromaDB
+        query_embedding = self.embedding_service.get_embedding(query)
+        dense_results = self.vector_store.query(
+            user_id=user_id,
+            query_embedding=query_embedding,
+            top_k=top_k,
+        )
+
+        # Sparse retrieval via BM25
+        bm25_results = self.bm25_store.search(
+            user_id=user_id,
+            query=query,
+            top_k=top_k,
+        )
+
+        # Fuse scores using RRF
+        fused = self._rrf_fusion(dense_results, bm25_results, top_k=top_k)
+        return fused
+
+    def _rrf_fusion(
+        self,
+        dense_results: list[dict[str, Any]],
+        bm25_results: list[dict[str, Any]],
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Fuse dense and sparse retrieval results using Reciprocal Rank Fusion.
+
+        RRF score = sum(1 / (k + rank)) for each list where the item appears.
+        k = 60 (standard value).
+        """
+        k = 60
+        scores: dict[str, dict[str, Any]] = {}
+
+        # Process dense results
+        for rank, result in enumerate(dense_results):
+            chunk_id = result["chunk_id"]
+            if chunk_id not in scores:
+                scores[chunk_id] = {"chunk": result, "score": 0.0}
+            scores[chunk_id]["score"] += 1.0 / (k + rank + 1)
+
+        # Process BM25 results
+        for rank, result in enumerate(bm25_results):
+            chunk_id = result["chunk_id"]
+            if chunk_id not in scores:
+                scores[chunk_id] = {"chunk": result, "score": 0.0}
+            scores[chunk_id]["score"] += 1.0 / (k + rank + 1)
+
+        # Sort by fused score descending
+        sorted_results = sorted(
+            scores.values(), key=lambda x: x["score"], reverse=True
+        )
+
+        # Return top_k with fused score
+        fused_results = []
+        for item in sorted_results[:top_k]:
+            result = item["chunk"]
+            result["rrf_score"] = item["score"]
+            fused_results.append(result)
+
+        return fused_results
+
+    def rerank(
+        self,
+        query: str,
+        results: list[dict[str, Any]],
+        top_k: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Re-rank results using Cross-Encoder (if enabled)."""
+        return self.rerank_service.rerank(query, results, top_k=top_k)
+
+    def generate_answer(
+        self,
+        query: str,
+        context_chunks: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Generate an answer from retrieved context.
+
+        Returns dict with:
+            answer: Generated response text.
+            citations: List of citation dicts.
+            abstained: Whether the system abstained.
+            abstention_reason: Reason for abstention (if abstained).
+        """
+        if not context_chunks:
+            return {
+                "answer": "",
+                "citations": [],
+                "abstained": True,
+                "abstention_reason": "No documents found matching your query.",
+            }
+
+        # Build context from chunks with citation markers
+        context_parts = []
+        citation_map = {}  # cite:chunk_id -> citation info
+
+        for i, chunk in enumerate(context_chunks):
+            chunk_id = chunk["chunk_id"]
+            cite_marker = f"[[cite:{chunk_id}]]"
+            context_parts.append(f"[{i+1}] {chunk['content']}")
+            citation_map[cite_marker] = {
+                "chunk_id": chunk_id,
+                "document_id": chunk.get("document_id", ""),
+                "filename": chunk.get("metadata", {}).get("filename", "unknown"),
+                "page_number": chunk.get("metadata", {}).get("page_number"),
+                "section": chunk.get("metadata", {}).get("section"),
+            }
+
+        context_text = "\n\n".join(context_parts)
+
+        system_prompt = """You are a helpful assistant that answers questions based ONLY on the provided document context.
+
+Rules:
+1. Answer ONLY using information from the provided context chunks.
+2. For each fact you state, cite the source using [[cite:chunk_id]] format.
+3. If the documents don't contain sufficient evidence to answer the question, say "I could not find sufficient evidence in your documents to answer this question."
+4. Do not invent information not present in the documents.
+5. If sources conflict, present both perspectives.
+6. Keep answers concise and direct.

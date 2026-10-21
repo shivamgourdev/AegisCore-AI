@@ -1,0 +1,254 @@
+=== RAG API: IMPORTS AND INGESTION ===
+   1: """RAG API routes.
+   2: 
+   3: Endpoints:
+   4: - POST /api/v1/rag/ingest - Upload and index a document
+   5: - POST /api/v1/rag/query - Ask a question over uploaded documents
+   6: - GET /api/v1/rag/documents - List user's documents
+   7: - DELETE /api/v1/rag/documents/{document_id} - Delete a document
+   8: - GET /api/v1/rag/documents/{document_id} - Get document metadata
+   9: """
+  10: 
+  11: import logging
+  12: from typing import Any
+  13: 
+  14: from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+  15: 
+  16: from app.core.config import settings
+  17: from app.dependencies import get_current_active_user, get_db
+  18: from app.models.user import User
+  19: from app.services.embedding_service import EmbeddingService
+  20: from app.services.generation_service import GenerationService
+  21: from app.services.ingestion_service import extract_and_chunk
+  22: from app.services.rag_service import RAGService
+  23: from app.services.upload_service import validate_upload
+  24: from app.services.vector_store import VectorStore
+  25: 
+  26: router = APIRouter()
+  27: logger = logging.getLogger(__name__)
+  28: 
+  29: 
+  30: def _get_rag_service() -> RAGService:
+  31:     """Create a RAG service instance with all dependencies."""
+  32:     embedding_service = EmbeddingService()
+  33:     vector_store = VectorStore()
+  34:     bm25_store = None  # Will be initialized with chunks from DB
+  35:     rerank_service = None  # Will be initialized conditionally
+  36:     generation_service = GenerationService()
+  37: 
+  38:     return RAGService()
+  39: 
+  40: 
+  41: @router.post("/ingest", status_code=201)
+  42: async def ingest_document(
+  43:     file: UploadFile,
+  44:     current_user: User = Depends(get_current_active_user),
+  45:     db=Depends(get_db),
+  46: ) -> dict[str, Any]:
+  47:     """Upload and index a document.
+  48: 
+  49:     Extracts text, chunks it, generates embeddings, and stores everything
+  50:     for RAG retrieval.
+  51:     """
+  52:     import traceback
+  53: 
+  54:     # Read file content
+  55:     try:
+  56:         content = await file.read()
+  57:     except Exception as e:
+  58:         logger.error(f"Failed to read uploaded file: {type(e).__name__}: {e}")
+  59:         raise HTTPException(status_code=415, detail=f"Failed to read file: {str(e)}")
+  60: 
+  61:     # Validate upload
+  62:     try:
+  63:         extension = validate_upload(file.filename, file.content_type, file)
+  64:     except ValueError as e:
+  65:         raise HTTPException(status_code=415, detail=str(e))
+  66:     except Exception as e:
+  67:         logger.error(f"Upload validation error: {type(e).__name__}: {e}")
+  68:         traceback.print_exc()
+  69:         raise HTTPException(status_code=415, detail=f"Upload validation error: {str(e)}")
+  70: 
+  71:     # Re-read content (validate_upload consumed it)
+  72:     content = await file.read()
+  73: 
+  74:     # Extract and chunk
+  75:     try:
+  76:         result = extract_and_chunk(content, file.filename, file.content_type)
+  77:     except ValueError as e:
+  78:         raise HTTPException(status_code=415, detail=str(e))
+  79:     except Exception as e:
+  80:         import traceback
+  81:         tb_module.print_exc()
+  82:         error_msg = f"Extraction error: {type(e).__name__}: {e}"
+  83:         logger.error(error_msg)
+  84:         traceback.print_exc()
+  85:         raise HTTPException(status_code=500, detail=error_msg)
+  86: 
+  87:     # Store document record in PostgreSQL
+  88:     import uuid
+  89: 
+  90:     document_id = str(uuid.uuid4())
+  91:     user_id = str(current_user.id)
+  92: 
+  93:     from app.models.document import Document
+  94: 
+  95:     db_document = Document(
+  96:         id=document_id,
+  97:         user_id=user_id,
+  98:         filename=file.filename,
+  99:         content_type=file.content_type or "application/octet-stream",
+ 100:         size_bytes=len(content),
+ 101:         storage_path=f"data/uploads/{user_id}/{document_id}",
+ 102:         status="indexing",
+ 103:         chunk_count=len(result["chunks"]),
+ 104:     )
+ 105:     db.add(db_document)
+ 106:     db.commit()
+ 107:     db.refresh(db_document)
+ 108: 
+ 109:     # Process chunks: embed + store in ChromaDB + add to BM25
+ 110:     embedding_service = EmbeddingService()
+ 111:     vector_store = VectorStore()
+ 112: 
+ 113:     chunk_records = []
+ 114:     embeddings = []
+ 115:     embedding_texts = []
+ 116:     embedding_ids = []
+ 117: 
+ 118:     for chunk in result["chunks"]:
+ 119:         chunk_id = str(uuid.uuid4())
+ 120:         chunk_records.append(
+ 121:             {
+ 122:                 "id": chunk_id,
+ 123:                 "document_id": document_id,
+ 124:                 "user_id": user_id,
+ 125:                 "chunk_index": chunk["chunk_index"],
+ 126:                 "content": chunk["content"],
+ 127:                 "page_number": None,  # Could be extracted from PDF metadata
+ 128:                 "section": None,
+ 129:                 "metadata": {"filename": file.filename},
+ 130:                 "embedding_id": chunk_id,
+ 131:             }
+ 132:         )
+ 133:         embedding_texts.append(chunk["content"])
+ 134:         embedding_ids.append(chunk_id)
+ 135: 
+ 136:     # Generate embeddings
+ 137:     try:
+ 138:         embeddings = embedding_service.get_embeddings(embedding_texts)
+ 139:         logger.info(f"Generated {len(embeddings)} embeddings")
+ 140:     except Exception as e:
+ 141:         import traceback
+ 142:         logger.error(f"Embedding failed: {type(e).__name__}: {e}")
+ 143:         traceback.print_exc()
+ 144:         db_document.status = "failed"
+ 145:         db.commit()
+ 146:         raise HTTPException(
+ 147:             status_code=503, detail=f"Embedding service unavailable: {type(e).__name__}: {e}"
+ 148:         )
+ 149: 
+ 150:     # Store vectors in ChromaDB
+ 151:     try:
+ 152:         vector_store.add_vectors(
+ 153:             user_id=user_id,
+ 154:             ids=embedding_ids,
+ 155:             embeddings=embeddings,
+ 156:             documents=[c["content"] for c in chunk_records],
+ 157:             metadatas=[
+ 158:                 {
+ 159:                     "document_id": cr["document_id"],
+ 160:                     "chunk_index": cr["chunk_index"],
+ 161:                     "filename": file.filename,
+ 162:                 }
+ 163:                 for cr in chunk_records
+ 164:             ],
+ 165:         )
+ 166:     except Exception as e:
+ 167:         logger.error(f"Vector store error: {e}")
+ 168:         db_document.status = "failed"
+ 169:         db.commit()
+ 170:         raise HTTPException(
+ 171:             status_code=503, detail=f"Vector store error: {e}"
+ 172:         )
+ 173: 
+ 174:     # Store chunks in PostgreSQL
+ 175:     for chunk_record in chunk_records:
+ 176:         db_chunk = Chunk(
+ 177:             id=chunk_record["id"],
+ 178:             document_id=chunk_record["document_id"],
+ 179:             user_id=chunk_record["user_id"],
+ 180:             chunk_index=chunk_record["chunk_index"],
+ 181:             content=chunk_record["content"],
+ 182:             page_number=chunk_record["page_number"],
+ 183:             section=chunk_record["section"],
+ 184:             metadata_=chunk_record["metadata"],
+ 185:             embedding_id=chunk_record["embedding_id"],
+ 186:         )
+ 187:         db.add(db_chunk)
+ 188: 
+ 189:     # Update document status
+ 190:     db_document.status = "indexed"
+ 191:     db.commit()
+ 192: 
+ 193:     logger.info(
+ 194:         f"Ingested document {document_id} for user {user_id}: "
+ 195:         f"{len(chunk_records)} chunks"
+ 196:     )
+ 197: 
+ 198:     return {
+ 199:         "document_id": document_id,
+ 200:         "filename": file.filename,
+ 201:         "chunk_count": len(chunk_records),
+ 202:         "status": "indexed",
+ 203:     }
+ 204: 
+ 205: 
+
+=== CHUNK MODEL DEFINITIONS AND IMPORTS ===
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\api\v1\rag.py:21: from app.services.ingestion_service import extract_and_chunk
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\api\v1\rag.py:272: from app.models.document import Document, Chunk
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\models\document.py:10: class Document(Base):
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\models\document.py:24: class Chunk(Base):
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\rag_service.py:18: from app.models.document import Document, Chunk
+
+=== GENERATION SERVICE TIMEOUT SETTINGS ===
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:1: """Embedding service using Ollama.
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:4: Ollama's nomic-embed-text model. Includes model compatibility checks and
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:19: """Client for Ollama embedding model (nomic-embed-text).
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:26: self.base_url = settings.ollama_base_url.rstrip("/")
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:31: """Create an httpx client with appropriate timeout."""
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:32: return httpx.Client(base_url=self.base_url, timeout=httpx.Timeout(60.0))
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:44: RuntimeError: If Ollama is unavailable or embedding fails.
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\embedding_service.py:92: """Check if the embedding model is available via Ollama."""
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:1: """LLM generation service with Gemini-first, Ollama fallback.
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:5: 2. Ollama local LLM (phi3.5:3.8b)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:21: class GenerationService:
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:22: """LLM generation with Gemini-first, Ollama fallback.
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:25: local Ollama model. Never claims generation succeeded unless a real
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:33: self.ollama_base_url = settings.ollama_base_url.rstrip("/")
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:34: self.ollama_model = settings.rag_llm_model
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:36: self._ollama_available: Optional[bool] = None
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:39: """Create an httpx client with appropriate timeout."""
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:40: return httpx.Client(timeout=httpx.Timeout(60.0))
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:50: Tries Gemini first, falls back to Ollama, raises on failure.
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:61: RuntimeError: If both Gemini and Ollama are unavailable.
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:68: logger.warning(f"Gemini generation failed: {e}. Falling back to Ollama.")
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:70: # Fall back to Ollama
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:72: return self._generate_ollama(system_prompt, user_prompt, temperature)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:75: f"LLM generation failed. Gemini: unavailable, Ollama: {e}"
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:127: def _generate_ollama(
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:133: """Generate using Ollama local model."""
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:134: url = f"{self.ollama_base_url}/api/generate"
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:136: "model": self.ollama_model,
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:145: f"Ollama API error: HTTP {response.status_code}: {response.text[:200]}"
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:151: raise RuntimeError(f"Ollama response has no text: {data}")
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:157: # Check Ollama first (no credentials needed)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:159: self._generate_ollama("You are a test.", "Hello", 0.0)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:184: def ollama_available(self) -> bool:
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:185: """Check if Ollama model is reachable."""
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\generation_service.py:187: self._generate_ollama("You are a test.", "Hello", 0.0)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\rag_service.py:4: 1. Query embedding (Ollama nomic-embed-text)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\rag_service.py:8: 5. LLM generation (Gemini ? Ollama)
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\rag_service.py:32: - EmbeddingService: Query embedding via Ollama
+C:\Users\shiva\Desktop\Aegiscore_AI\backend\app\services\rag_service.py:36: - GenerationService: LLM answer generation (Gemini ? Ollama)

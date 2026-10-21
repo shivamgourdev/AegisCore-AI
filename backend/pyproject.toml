@@ -1,0 +1,52 @@
+[project]
+name = "aegis-backend"
+version = "0.1.0"
+description = "AegisCore AI backend - FastAPI API, RAG, email drafting, Gmail OAuth2"
+requires-python = ">=3.11"
+
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+    "pydantic-settings>=2.2.1",
+    "sqlalchemy>=2.0.29",
+    "alembic>=1.13.1",
+    "psycopg2-binary>=2.9.9",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-multipart>=0.0.6",
+    "python-dotenv>=1.0.1",
+    "cryptography>=42.0.8",
+    "redis>=5.0.1",
+    "celery>=5.3.6",
+    "chromadb>=0.5.0",
+    "networkx>=3.3",
+    "pyPDF2>=3.0.1",
+    "openpyxl>=3.1.5",
+    "python-docx>=1.1.0",
+    "tiktoken>=0.5.0",
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "ruff",
+    "mypy",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true

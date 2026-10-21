@@ -1,0 +1,422 @@
+=== RAG API CODE ===
+   1: """RAG API routes.
+   2: 
+   3: Endpoints:
+   4: - POST /api/v1/rag/ingest - Upload and index a document
+   5: - POST /api/v1/rag/query - Ask a question over uploaded documents
+   6: - GET /api/v1/rag/documents - List user's documents
+   7: - DELETE /api/v1/rag/documents/{document_id} - Delete a document
+   8: - GET /api/v1/rag/documents/{document_id} - Get document metadata
+   9: """
+  10: 
+  11: import logging
+  12: from typing import Any
+  13: 
+  14: from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+  15: 
+  16: from app.core.config import settings
+  17: from app.dependencies import get_current_active_user, get_db
+  18: from app.models.user import User
+  19: from app.models.document import Chunk
+  20: from app.services.embedding_service import EmbeddingService
+  21: from app.services.generation_service import GenerationService
+  22: from app.services.ingestion_service import extract_and_chunk
+  23: from app.services.rag_service import RAGService
+  24: from app.services.upload_service import validate_upload
+  25: from app.services.vector_store import VectorStore
+  26: 
+  27: router = APIRouter()
+  28: logger = logging.getLogger(__name__)
+  29: 
+  30: 
+  31: def _get_rag_service() -> RAGService:
+  32:     """Create a RAG service instance with all dependencies."""
+  33:     embedding_service = EmbeddingService()
+  34:     vector_store = VectorStore()
+  35:     bm25_store = None  # Will be initialized with chunks from DB
+  36:     rerank_service = None  # Will be initialized conditionally
+  37:     generation_service = GenerationService()
+  38: 
+  39:     return RAGService()
+  40: 
+  41: 
+  42: @router.post("/ingest", status_code=201)
+  43: async def ingest_document(
+  44:     file: UploadFile,
+  45:     current_user: User = Depends(get_current_active_user),
+  46:     db=Depends(get_db),
+  47: ) -> dict[str, Any]:
+  48:     """Upload and index a document.
+  49: 
+  50:     Extracts text, chunks it, generates embeddings, and stores everything
+  51:     for RAG retrieval.
+  52:     """
+  53:     import traceback
+  54: 
+  55:     # Read file content
+  56:     try:
+  57:         content = await file.read()
+  58:     except Exception as e:
+  59:         logger.error(f"Failed to read uploaded file: {type(e).__name__}: {e}")
+  60:         raise HTTPException(status_code=415, detail=f"Failed to read file: {str(e)}")
+  61: 
+  62:     # Validate upload
+  63:     try:
+  64:         extension = validate_upload(file.filename, file.content_type, file)
+  65:     except ValueError as e:
+  66:         raise HTTPException(status_code=415, detail=str(e))
+  67:     except Exception as e:
+  68:         logger.error(f"Upload validation error: {type(e).__name__}: {e}")
+  69:         traceback.print_exc()
+  70:         raise HTTPException(status_code=415, detail=f"Upload validation error: {str(e)}")
+  71: 
+  72:     # Re-read content (validate_upload consumed it)
+  73:     content = await file.read()
+  74: 
+  75:     # Extract and chunk
+  76:     try:
+  77:         result = extract_and_chunk(content, file.filename, file.content_type)
+  78:     except ValueError as e:
+  79:         raise HTTPException(status_code=415, detail=str(e))
+  80:     except Exception as e:
+  81:         import traceback
+  82:         traceback.print_exc()
+  83:         error_msg = f"Extraction error: {type(e).__name__}: {e}"
+  84:         logger.error(error_msg)
+  85:         traceback.print_exc()
+  86:         raise HTTPException(status_code=500, detail=error_msg)
+  87: 
+  88:     # Store document record in PostgreSQL
+  89:     import uuid
+  90: 
+  91:     document_id = str(uuid.uuid4())
+  92:     user_id = str(current_user.id)
+  93: 
+  94:     from app.models.document import Document
+  95: 
+  96:     db_document = Document(
+  97:         id=document_id,
+  98:         user_id=user_id,
+  99:         filename=file.filename,
+ 100:         content_type=file.content_type or "application/octet-stream",
+ 101:         size_bytes=len(content),
+ 102:         storage_path=f"data/uploads/{user_id}/{document_id}",
+ 103:         status="indexing",
+ 104:         chunk_count=len(result["chunks"]),
+ 105:     )
+ 106:     db.add(db_document)
+ 107:     db.commit()
+ 108:     db.refresh(db_document)
+ 109: 
+ 110:     # Process chunks: embed + store in ChromaDB + add to BM25
+ 111:     embedding_service = EmbeddingService()
+ 112:     vector_store = VectorStore()
+ 113: 
+ 114:     chunk_records = []
+ 115:     embeddings = []
+ 116:     embedding_texts = []
+ 117:     embedding_ids = []
+ 118: 
+ 119:     for chunk in result["chunks"]:
+ 120:         chunk_id = str(uuid.uuid4())
+ 121:         chunk_records.append(
+ 122:             {
+ 123:                 "id": chunk_id,
+ 124:                 "document_id": document_id,
+ 125:                 "user_id": user_id,
+ 126:                 "chunk_index": chunk["chunk_index"],
+ 127:                 "content": chunk["content"],
+ 128:                 "page_number": None,  # Could be extracted from PDF metadata
+ 129:                 "section": None,
+ 130:                 "metadata": {"filename": file.filename},
+ 131:                 "embedding_id": chunk_id,
+ 132:             }
+ 133:         )
+ 134:         embedding_texts.append(chunk["content"])
+ 135:         embedding_ids.append(chunk_id)
+ 136: 
+ 137:     # Generate embeddings
+ 138:     try:
+ 139:         embeddings = embedding_service.get_embeddings(embedding_texts)
+ 140:         logger.info(f"Generated {len(embeddings)} embeddings")
+ 141:     except Exception as e:
+ 142:         import traceback
+ 143:         tb_str = traceback.format_exc()
+ 144:         logger.error(f"Embedding failed: {type(e).__name__}: {e}\n{tb_str}")
+ 145:         db_document.status = "failed"
+ 146:         db.commit()
+ 147:         raise HTTPException(
+ 148:             status_code=503,
+ 149:             detail=f"Embedding service unavailable: {type(e).__name__}: {e}\n{tb_str}",
+ 150:         )
+ 151: 
+ 152:     # Store vectors in ChromaDB
+ 153:     try:
+ 154:         vector_store.add_vectors(
+ 155:             user_id=user_id,
+ 156:             ids=embedding_ids,
+ 157:             embeddings=embeddings,
+ 158:             documents=[c["content"] for c in chunk_records],
+ 159:             metadatas=[
+ 160:                 {
+ 161:                     "document_id": cr["document_id"],
+ 162:                     "chunk_index": cr["chunk_index"],
+ 163:                     "filename": file.filename,
+ 164:                 }
+ 165:                 for cr in chunk_records
+ 166:             ],
+ 167:         )
+ 168:     except Exception as e:
+ 169:         logger.error(f"Vector store error: {e}")
+ 170:         db_document.status = "failed"
+ 171:         db.commit()
+ 172:         raise HTTPException(
+ 173:             status_code=503, detail=f"Vector store error: {e}"
+ 174:         )
+ 175: 
+ 176:     # Store chunks in PostgreSQL
+ 177:     for chunk_record in chunk_records:
+ 178:         db_chunk = Chunk(
+ 179:             id=chunk_record["id"],
+ 180:             document_id=chunk_record["document_id"],
+ 181:             user_id=chunk_record["user_id"],
+ 182:             chunk_index=chunk_record["chunk_index"],
+ 183:             content=chunk_record["content"],
+ 184:             page_number=chunk_record["page_number"],
+ 185:             section=chunk_record["section"],
+ 186:             metadata_=chunk_record["metadata"],
+ 187:             embedding_id=chunk_record["embedding_id"],
+ 188:         )
+ 189:         db.add(db_chunk)
+ 190: 
+ 191:     # Update document status
+ 192:     db_document.status = "indexed"
+ 193:     db.commit()
+ 194: 
+ 195:     logger.info(
+ 196:         f"Ingested document {document_id} for user {user_id}: "
+ 197:         f"{len(chunk_records)} chunks"
+ 198:     )
+ 199: 
+ 200:     return {
+ 201:         "document_id": document_id,
+ 202:         "filename": file.filename,
+ 203:         "chunk_count": len(chunk_records),
+ 204:         "status": "indexed",
+ 205:     }
+ 206: 
+ 207: 
+ 208: @router.post("/query")
+ 209: async def query_documents(
+ 210:     body: dict,
+ 211:     current_user: User = Depends(get_current_active_user),
+ 212:     db=Depends(get_db),
+ 213: ) -> dict[str, Any]:
+ 214:     """Ask a question over uploaded documents.
+ 215: 
+ 216:     Uses hybrid retrieval (dense + BM25 + RRF), Cross-Encoder reranking,
+ 217:     and LLM generation with citation verification.
+ 218:     """
+ 219:     question = body.get("question", "").strip()
+ 220:     if not question:
+ 221:         raise HTTPException(status_code=422, detail="Question is required")
+ 222: 
+ 223:     top_k = body.get("top_k", 5)
+ 224:     user_id = str(current_user.id)
+ 225: 
+ 226:     rag_service = _get_rag_service()
+ 227:     result = rag_service.full_rag_pipeline(
+ 228:         user_id=user_id,
+ 229:         query=question,
+ 230:         top_k=top_k,
+ 231:     )
+ 232: 
+ 233:     return result
+ 234: 
+ 235: 
+ 236: @router.get("/documents")
+ 237: async def list_documents(
+ 238:     current_user: User = Depends(get_current_active_user),
+ 239:     db=Depends(get_db),
+ 240: ) -> list[dict[str, Any]]:
+ 241:     """List all documents for the current user."""
+ 242:     from app.models.document import Document
+ 243: 
+ 244:     docs = (
+ 245:         db.query(Document)
+ 246:         .filter(Document.user_id == str(current_user.id))
+ 247:         .all()
+ 248:     )
+ 249: 
+ 250:     return [
+
+=== RAG SERVICE / CHUNK DEFINITIONS AND USAGE ===
+
+  backend\app\api\v1\rag.py:17:from app.dependencies import get_current_active_user, get_db
+  backend\app\api\v1\rag.py:18:from app.models.user import User
+  backend\app\api\v1\rag.py:19:from app.models.document import Chunk
+> backend\app\api\v1\rag.py:20:from app.services.embedding_service import EmbeddingService
+  backend\app\api\v1\rag.py:21:from app.services.generation_service import GenerationService
+  backend\app\api\v1\rag.py:22:from app.services.ingestion_service import extract_and_chunk
+  backend\app\api\v1\rag.py:23:from app.services.rag_service import RAGService
+  backend\app\api\v1\rag.py:24:from app.services.upload_service import validate_upload
+  backend\app\api\v1\rag.py:25:from app.services.vector_store import VectorStore
+  backend\app\api\v1\rag.py:30:
+  backend\app\api\v1\rag.py:31:def _get_rag_service() -> RAGService:
+  backend\app\api\v1\rag.py:32:    """Create a RAG service instance with all dependencies."""
+> backend\app\api\v1\rag.py:33:    embedding_service = EmbeddingService()
+  backend\app\api\v1\rag.py:34:    vector_store = VectorStore()
+  backend\app\api\v1\rag.py:35:    bm25_store = None  # Will be initialized with chunks from DB
+  backend\app\api\v1\rag.py:36:    rerank_service = None  # Will be initialized conditionally
+  backend\app\api\v1\rag.py:37:    generation_service = GenerationService()
+  backend\app\api\v1\rag.py:38:
+  backend\app\api\v1\rag.py:108:    db.refresh(db_document)
+  backend\app\api\v1\rag.py:109:
+  backend\app\api\v1\rag.py:110:    # Process chunks: embed + store in ChromaDB + add to BM25
+> backend\app\api\v1\rag.py:111:    embedding_service = EmbeddingService()
+  backend\app\api\v1\rag.py:112:    vector_store = VectorStore()
+  backend\app\api\v1\rag.py:113:
+  backend\app\api\v1\rag.py:114:    chunk_records = []
+  backend\app\api\v1\rag.py:115:    embeddings = []
+  backend\app\api\v1\rag.py:116:    embedding_texts = []
+  backend\app\api\v1\rag.py:136:
+  backend\app\api\v1\rag.py:137:    # Generate embeddings
+  backend\app\api\v1\rag.py:138:    try:
+> backend\app\api\v1\rag.py:139:        embeddings = embedding_service.get_embeddings(embedding_texts)
+  backend\app\api\v1\rag.py:140:        logger.info(f"Generated {len(embeddings)} embeddings")
+  backend\app\api\v1\rag.py:141:    except Exception as e:
+  backend\app\api\v1\rag.py:142:        import traceback
+  backend\app\api\v1\rag.py:143:        tb_str = traceback.format_exc()
+  backend\app\api\v1\rag.py:144:        logger.error(f"Embedding failed: {type(e).__name__}: {e}\n{tb_str}")
+  backend\app\api\v1\rag.py:175:
+  backend\app\api\v1\rag.py:176:    # Store chunks in PostgreSQL
+  backend\app\api\v1\rag.py:177:    for chunk_record in chunk_records:
+> backend\app\api\v1\rag.py:178:        db_chunk = Chunk(
+  backend\app\api\v1\rag.py:179:            id=chunk_record["id"],
+  backend\app\api\v1\rag.py:180:            document_id=chunk_record["document_id"],
+  backend\app\api\v1\rag.py:181:            user_id=chunk_record["user_id"],
+  backend\app\api\v1\rag.py:182:            chunk_index=chunk_record["chunk_index"],
+  backend\app\api\v1\rag.py:183:            content=chunk_record["content"],
+  backend\app\api\v1\rag.py:186:            metadata_=chunk_record["metadata"],
+  backend\app\api\v1\rag.py:187:            embedding_id=chunk_record["embedding_id"],
+  backend\app\api\v1\rag.py:188:        )
+> backend\app\api\v1\rag.py:189:        db.add(db_chunk)
+  backend\app\api\v1\rag.py:190:
+  backend\app\api\v1\rag.py:191:    # Update document status
+  backend\app\api\v1\rag.py:192:    db_document.status = "indexed"
+  backend\app\api\v1\rag.py:193:    db.commit()
+  backend\app\api\v1\rag.py:194:
+  backend\app\models\document.py:21:    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
+  backend\app\models\document.py:22:
+  backend\app\models\document.py:23:
+> backend\app\models\document.py:24:class Chunk(Base):
+  backend\app\models\document.py:25:    __tablename__ = "chunks"
+  backend\app\models\document.py:26:
+  backend\app\models\document.py:27:    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+  backend\app\models\document.py:28:    document_id: Mapped[str] = mapped_column(
+  backend\app\models\document.py:29:        String(36), ForeignKey("documents.id"), nullable=False, index=True
+  backend\app\services\rag_service.py:16:from app.core.config import settings
+  backend\app\services\rag_service.py:17:from app.core.database import SessionLocal
+  backend\app\services\rag_service.py:18:from app.models.document import Document, Chunk
+> backend\app\services\rag_service.py:19:from app.services.embedding_service import EmbeddingService
+  backend\app\services\rag_service.py:20:from app.services.generation_service import GenerationService
+  backend\app\services\rag_service.py:21:from app.services.rerank_service import RerankService
+  backend\app\services\rag_service.py:22:from app.services.vector_store import VectorStore
+  backend\app\services\rag_service.py:23:from app.services.bm25_store import BM25Store
+  backend\app\services\rag_service.py:24:
+  backend\app\services\rag_service.py:25:logger = logging.getLogger(__name__)
+  backend\app\services\rag_service.py:26:
+  backend\app\services\rag_service.py:27:
+> backend\app\services\rag_service.py:28:class RAGService:
+  backend\app\services\rag_service.py:29:    """Orchestrates the full RAG pipeline.
+  backend\app\services\rag_service.py:30:
+  backend\app\services\rag_service.py:31:    Components:
+  backend\app\services\rag_service.py:32:    - EmbeddingService: Query embedding via Ollama
+  backend\app\services\rag_service.py:33:    - VectorStore: Dense retrieval via ChromaDB
+  backend\app\services\rag_service.py:37:    """
+  backend\app\services\rag_service.py:38:
+  backend\app\services\rag_service.py:39:    def __init__(self) -> None:
+> backend\app\services\rag_service.py:40:        self.embedding_service = EmbeddingService()
+  backend\app\services\rag_service.py:41:        self.vector_store = VectorStore()
+  backend\app\services\rag_service.py:42:        self.bm25_store = BM25Store()
+  backend\app\services\rag_service.py:43:        self.rerank_service = RerankService()
+  backend\app\services\rag_service.py:44:        self.generation_service = GenerationService()
+  backend\app\services\rag_service.py:45:        self.rrf_k = settings.rag_rerank_top_k if hasattr(settings, "rag_rerank_top_k") else 8
+  backend\app\services\rag_service.py:61:            List of candidate chunks with scores.
+  backend\app\services\rag_service.py:62:        """
+  backend\app\services\rag_service.py:63:        # Dense retrieval via ChromaDB
+> backend\app\services\rag_service.py:64:        query_embedding = self.embedding_service.get_embedding(query)
+  backend\app\services\rag_service.py:65:        dense_results = self.vector_store.query(
+  backend\app\services\rag_service.py:66:            user_id=user_id,
+  backend\app\services\rag_service.py:67:            query_embedding=query_embedding,
+  backend\app\services\rag_service.py:68:            top_k=top_k,
+  backend\app\services\rag_service.py:69:        )
+
+
+
+
+=== PROBLEMATIC TEST FILES ===
+
+--- backend/test_clean.py ---
+Size: 126 bytes; null bytes: 62
+First 120 bytes: b'\xff\xfef\x00r\x00o\x00m\x00 \x00a\x00p\x00p\x00.\x00s\x00e\x00r\x00v\x00i\x00c\x00e\x00s\x00.\x00i\x00n\x00g\x00e\x00s\x00t\x00i\x00o\x00n\x00_\x00s\x00e\x00r\x00v\x00i\x00c\x00e\x00 \x00i\x00m\x00p\x00o\x00r\x00t\x00 \x00e\x00x\x00t\x00r\x00a\x00c\x00t\x00_\x00a\x00n\x00d\x00_\x00c\x00h\x00u\x00n\x00'
+
+--- backend/test_e2e.py ---
+Size: 126 bytes; null bytes: 62
+First 120 bytes: b'\xff\xfef\x00r\x00o\x00m\x00 \x00a\x00p\x00p\x00.\x00s\x00e\x00r\x00v\x00i\x00c\x00e\x00s\x00.\x00i\x00n\x00g\x00e\x00s\x00t\x00i\x00o\x00n\x00_\x00s\x00e\x00r\x00v\x00i\x00c\x00e\x00 \x00i\x00m\x00p\x00o\x00r\x00t\x00 \x00e\x00x\x00t\x00r\x00a\x00c\x00t\x00_\x00a\x00n\x00d\x00_\x00c\x00h\x00u\x00n\x00'
+
+--- backend/test_e2e_full.py ---
+Size: 4148 bytes; null bytes: 0
+  1: import urllib.request, json, urllib.parse
+  2: 
+  3: def req(method, path, data=None, headers=None):
+  4:     url = "http://127.0.0.1:8009" + path
+  5:     req_headers = headers or {}
+  6:     body = None
+  7:     if data is not None:
+  8:         body = json.dumps(data).encode("utf-8")
+  9:         req_headers["Content-Type"] = "application/json"
+ 10:     r = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+ 11:     try:
+ 12:         resp = urllib.request.urlopen(r, timeout=30)
+ 13:         return resp.status, resp.read().decode()
+ 14:     except urllib.error.HTTPError as e:
+ 15:         return e.code, e.read().decode()
+ 16:     except Exception as e:
+ 17:         return "ERR", str(e)[:200]
+ 18: 
+
+--- backend/test_extract.py ---
+Size: 592 bytes; null bytes: 0
+  1: from app.services.ingestion_service import extract_and_chunk
+  2: content = b"# Machine Learning Basics\n\nMachine learning is a branch of artificial intelligence.\n\n## Supervised Learning\nSupervised learning uses labeled training data to learn a mapping function from inputs to outputs."
+  3: result = extract_and_chunk(content, 'test.md', 'text/markdown')
+  4: print(f"Extraction successful: {len(result['chunks'])} chunks")
+  5: for chunk in result['chunks']:
+  6:     print(f"  Chunk {chunk['chunk_index']}: {len(chunk['content'])} chars")
+  7: except Exception as e:
+  8:     import traceback
+  9:     traceback.print_exc()
+
+--- backend/test_ingest.py ---
+Size: 465 bytes; null bytes: 0
+python : Traceback (most recent call last):
+At line:44 char:6
++ '@ | python - 2>&1 | Out-File $report -Append
++      ~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Tra 
+   ceback (most recent call last)::String) [],   
+  RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "<stdin>", line 24, in <module>
+  File "C:\Users\shiva\AppData\Local\Programs\Pyt
+hon\Python311\Lib\encodings\cp1252.py", line 19, 
+in encode
+    return codecs.charmap_encode(input,self.error
+s,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode 
+character '\ufeff' in position 5: character maps 
+to <undefined>
