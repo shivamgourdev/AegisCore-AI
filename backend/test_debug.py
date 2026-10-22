@@ -1,4 +1,4 @@
-from app.services.ingestion_service import extract_and_chunk
+﻿from app.services.ingestion_service import extract_and_chunk
 from app.services.embedding_service import EmbeddingService
 from app.services.vector_store import VectorStore
 

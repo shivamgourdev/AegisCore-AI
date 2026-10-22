@@ -61,12 +61,12 @@ if token:
     print(f"  Status: {status}")
     if status == 200:
         rb = json.loads(body)
-        print(f"  Answer: {rb.get('answer', '')[:300]}")
-        print(f"  Citations: {len(rb.get('citations', []))}")
+        print(f"  Answer: {rb.get(\"answer\", \"\")[:300]}")
+        print(f"  Citations: {len(rb.get(\"citations\", []))}")
         for c in rb.get("citations", []):
-            print(f"    - {c.get('filename', 'unknown')} (page {c.get('page_number')}, section: {c.get('section')})")
-        print(f"  Abstained: {rb.get('abstained')}")
-        print(f"  Reason: {rb.get('abstention_reason')}")
+            print(f"    - {c.get(\"filename\", \"unknown\")} (page {c.get(\"page_number\")}, section: {c.get(\"section\")})")
+        print(f"  Abstained: {rb.get(\"abstained\")}")
+        print(f"  Reason: {rb.get(\"abstention_reason\")}")
     else:
         print(f"  Body: {body[:200]}")
 
@@ -77,9 +77,9 @@ if token:
     print(f"  Status: {status}")
     if status == 200:
         rb = json.loads(body)
-        print(f"  Answer: {rb.get('answer', '')[:200]}")
-        print(f"  Abstained: {rb.get('abstained')}")
-        print(f"  Reason: {rb.get('abstention_reason')}")
+        print(f"  Answer: {rb.get(\"answer\", \"\")[:200]}")
+        print(f"  Abstained: {rb.get(\"abstained\")}")
+        print(f"  Reason: {rb.get(\"abstention_reason\")}")
     else:
         print(f"  Body: {body[:200]}")
 

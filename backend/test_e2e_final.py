@@ -1,4 +1,4 @@
-import urllib.request, json, urllib.parse
+﻿import urllib.request, json, urllib.parse
 
 def req(method, path, data=None, headers=None):
     url = "http://127.0.0.1:8009" + path
